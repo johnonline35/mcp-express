@@ -60,6 +60,67 @@ The implementation supports:
 - Progress updates for longer operations
 - Session termination via HTTP DELETE
 
+---
+
+## Modular System and Application Flow
+
+The application is built around a modular architecture, where each domain (user, documents, prompts, etc.) is encapsulated in its own module. This makes the system extensible, maintainable, and easy to understand.
+
+### Module Registration
+
+All modules are registered in `src/modules/index.ts` via the `registerAllModules` function. This function is called during app bootstrap and wires up each module's tools, resources, and prompts with the core MCP server.
+
+**Example:**
+```typescript
+export function registerAllModules(serverService, sessionManager) {
+  // Create module services
+  const userService = new UserService(sessionManager);
+  const documentsService = new DocumentsService(sessionManager);
+  const promptsService = new PromptsService(sessionManager);
+
+  // Register module components
+  registerUserTools(serverService, userService);
+  registerDocumentResources(serverService, documentsService);
+  registerDocumentTools(serverService, documentsService);
+  registerPromptTemplates(serverService, promptsService);
+  registerPromptTools(serverService, promptsService);
+}
+```
+
+### Module Types
+
+- **User Module:** Handles user-related tools (e.g., user info).
+- **Documents Module:** Provides document resources (fetch, list, filter by tag) and tools (search, summarize, analyze).
+- **Prompts Module:** Manages prompt templates and prompt-related tools.
+
+Each module typically provides:
+- A service class for business logic and data access.
+- Registration functions for tools, resources, or prompts.
+
+### How the App Works
+
+1. **Bootstrap:**  
+   The app starts in `src/index.ts` by calling `bootstrap()` from `src/app.ts`.
+2. **Express Setup:**  
+   In `src/app.ts`, an Express app is created, middleware is configured, and core services are instantiated.
+3. **Module Registration:**  
+   All modules are registered with the MCP server via `registerAllModules`.
+4. **Route Setup:**  
+   - Auth routes (`/auth/login`, `/auth/me`) are set up.
+   - MCP protocol routes (`/mcp`, etc.) are set up for client-server communication.
+5. **Session Management:**  
+   Each client session is managed independently, allowing for per-session state and tool activation.
+6. **Extending the System:**  
+   To add new features, simply create a new module with its own service and registration functions, then add it to `registerAllModules`.
+
+### Example: Adding a New Module
+
+1. Create a new folder in `src/modules/` (e.g., `analytics/`).
+2. Implement a service class and registration functions for your tools/resources.
+3. Import and register your module in `src/modules/index.ts`.
+
+---
+
 ## Getting Started
 
 ### Prerequisites
