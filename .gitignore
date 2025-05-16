@@ -1,0 +1,5 @@
+
+node_modules
+dist
+ai-context.txt
+gather-context.js
