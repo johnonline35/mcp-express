@@ -1,0 +1,2261 @@
+--- Start of package.json ---
+{
+  "name": "mcp-express",
+  "version": "1.0.0",
+  "description": "Simple MCP server with Express and authentication",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "test": "jest",
+    "context": "node gather-context.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "express",
+    "authentication"
+  ],
+  "author": "John Childs-Eddy",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.18",
+    "@types/express": "^5.0.1",
+    "@types/jsonwebtoken": "^9.0.9",
+    "@types/node": "^22.15.18",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  }
+}
+
+--- End of package.json ---
+
+--- Start of src/app.ts ---
+// src/app.ts
+import express from "express";
+import cors from "cors";
+import { McpServerService } from "./core/mcp-server-service";
+import { SessionManager } from "./core/session-manager";
+import { setupMcpRoutes } from "./core/http-controller";
+import { setupAuthRoutes } from "./routes/auth";
+import { registerAllModules } from "./modules/index";
+import { config } from "./shared/config";
+
+/**
+ * Bootstrap the application
+ */
+export async function bootstrap() {
+  // Create Express app
+  const app = express();
+
+  // Configure middleware
+  app.use(express.json({ limit: "50mb" }));
+  app.use(cors());
+
+  // Create core services
+  const serverService = new McpServerService("Test MCP Server", "1.0.0");
+  const sessionManager = new SessionManager(serverService);
+
+  // Register all modules
+  registerAllModules(serverService, sessionManager);
+
+  // Set up auth routes
+  setupAuthRoutes(app);
+
+  // Set up MCP routes
+  setupMcpRoutes(app, sessionManager);
+
+  // Start server
+  const PORT = config.port || 3000;
+  app.listen(PORT, () => {
+    console.log(`MCP Server running on port ${PORT}`);
+  });
+
+  return { app, serverService, sessionManager };
+}
+
+--- End of src/app.ts ---
+
+--- Start of src/core/http-controller.ts ---
+// src/core/http-controller.ts
+import { Application, Request, Response } from "express";
+import { SessionManager } from "./session-manager";
+import { authMiddleware } from "../middleware/auth";
+import { JsonRpcErrorCode, createJsonRpcError } from "../shared/errors";
+
+/**
+ * Sets up all MCP-related routes in the Express application
+ */
+export function setupMcpRoutes(
+  app: Application,
+  sessionManager: SessionManager
+): void {
+  // MCP endpoint - POST for client-to-server requests
+  // Apply auth middleware to protect these endpoints
+  app.post("/mcp", authMiddleware, (req: Request, res: Response) => {
+    // Pass along user info to the session
+    const sessionOptions = {
+      userId: req.user?.id,
+      username: req.user?.username,
+    };
+
+    sessionManager.handleRequest(req, res, "POST", sessionOptions);
+  });
+
+  // MCP endpoint - GET for server-to-client notifications
+  app.get("/mcp", authMiddleware, (req: Request, res: Response) => {
+    const sessionOptions = {
+      userId: req.user?.id,
+      username: req.user?.username,
+    };
+
+    sessionManager.handleRequest(req, res, "GET", sessionOptions);
+  });
+
+  // MCP endpoint - DELETE for session termination
+  app.delete("/mcp", authMiddleware, (req: Request, res: Response) => {
+    sessionManager.handleRequest(req, res, "DELETE");
+  });
+
+  // Health check endpoint (no auth needed)
+  app.get("/health", (_req: Request, res: Response) => {
+    res.status(200).json({ status: "ok" });
+  });
+
+  // Catch-all for invalid routes
+  app.use((_req: Request, res: Response) => {
+    if (!res.headersSent) {
+      res
+        .status(404)
+        .json(
+          createJsonRpcError(
+            JsonRpcErrorCode.MethodNotFound,
+            "Endpoint not found"
+          )
+        );
+    }
+  });
+
+  // Global error handler
+  app.use((err: Error, _req: Request, res: Response, _next: any) => {
+    console.error("Unhandled error:", err);
+    if (!res.headersSent) {
+      res
+        .status(500)
+        .json(
+          createJsonRpcError(
+            JsonRpcErrorCode.InternalError,
+            "Internal server error",
+            { details: err.message }
+          )
+        );
+    }
+  });
+}
+
+--- End of src/core/http-controller.ts ---
+
+--- Start of src/core/mcp-server-service.ts ---
+// src/core/mcp-server-service.ts
+import {
+  McpServer,
+  ResourceTemplate,
+  ReadResourceCallback,
+  ReadResourceTemplateCallback,
+} from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+
+// Type definitions for registration tracking
+type ToolHandler = (params: any, context: any) => Promise<any>;
+type StringResourceHandler = ReadResourceCallback;
+type TemplateResourceHandler = ReadResourceTemplateCallback;
+type PromptHandler = (params: any) => any;
+
+interface ToolRegistration {
+  name: string;
+  paramSchema: any;
+  handler: ToolHandler;
+  isDynamic: boolean;
+}
+
+interface StringResourceRegistration {
+  name: string;
+  uri: string;
+  handler: StringResourceHandler;
+}
+
+interface TemplateResourceRegistration {
+  name: string;
+  template: ResourceTemplate;
+  handler: TemplateResourceHandler;
+}
+
+interface PromptRegistration {
+  name: string;
+  paramSchema: any;
+  handler: PromptHandler;
+}
+
+export interface ServerConfig {
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+}
+
+// Track which dynamic tools are enabled for each session
+interface SessionToolState {
+  enabledDynamicTools: Set<string>;
+}
+
+/**
+ * Core service for managing MCP servers and their transports
+ */
+export class McpServerService {
+  private servers = new Map<string, ServerConfig>();
+  private defaultServer: McpServer;
+
+  // Registration tracking
+  private registeredTools = new Map<string, ToolRegistration>();
+  private registeredStringResources = new Map<
+    string,
+    StringResourceRegistration
+  >();
+  private registeredTemplateResources = new Map<
+    string,
+    TemplateResourceRegistration
+  >();
+  private registeredPrompts = new Map<string, PromptRegistration>();
+
+  // Track dynamic tool state per session
+  private sessionToolState = new Map<string, SessionToolState>();
+
+  constructor(
+    private readonly serverName = "MCP Server",
+    private readonly version = "1.0.0"
+  ) {
+    // Create default server for registration template
+    this.defaultServer = new McpServer({
+      name: serverName,
+      version,
+    });
+  }
+
+  /**
+   * Register a tool with the MCP service
+   */
+  registerTool(
+    name: string,
+    paramSchema: any,
+    handler: ToolHandler,
+    isDynamic: boolean = false
+  ): void {
+    // Store registration
+    const registration = { name, paramSchema, handler, isDynamic };
+    this.registeredTools.set(name, registration);
+
+    // If not dynamic, register with default server (for validation/schema)
+    // Dynamic tools will be registered per session when enabled
+    if (!isDynamic) {
+      this.defaultServer.tool(name, paramSchema, handler);
+    }
+
+    console.log(`Registered tool: ${name}${isDynamic ? " (dynamic)" : ""}`);
+  }
+
+  /**
+   * Register a dynamic tool that will be enabled based on context
+   */
+  registerDynamicTool(
+    name: string,
+    paramSchema: any,
+    handler: ToolHandler
+  ): void {
+    this.registerTool(name, paramSchema, handler, true);
+  }
+
+  /**
+   * Register a resource with the MCP service
+   */
+  registerResource(
+    name: string,
+    template: string | ResourceTemplate,
+    handler: StringResourceHandler | TemplateResourceHandler
+  ): void {
+    if (template instanceof ResourceTemplate) {
+      // Store template resource registration
+      const registration = {
+        name,
+        template,
+        handler: handler as TemplateResourceHandler,
+      };
+      this.registeredTemplateResources.set(name, registration);
+
+      // Register with default server
+      this.defaultServer.resource(
+        name,
+        template,
+        handler as TemplateResourceHandler
+      );
+    } else {
+      // Store string resource registration
+      const registration = {
+        name,
+        uri: template,
+        handler: handler as StringResourceHandler,
+      };
+      this.registeredStringResources.set(name, registration);
+
+      // Register with default server
+      this.defaultServer.resource(
+        name,
+        template,
+        handler as StringResourceHandler
+      );
+    }
+
+    console.log(`Registered resource: ${name}`);
+  }
+
+  /**
+   * Register a prompt with the MCP service
+   */
+  registerPrompt(name: string, paramSchema: any, handler: PromptHandler): void {
+    // Store registration
+    const registration = { name, paramSchema, handler };
+    this.registeredPrompts.set(name, registration);
+
+    // Register with default server (for validation/schema)
+    this.defaultServer.prompt(name, paramSchema, handler);
+
+    console.log(`Registered prompt: ${name}`);
+  }
+
+  /**
+   * Enable dynamic tools for a specific session
+   */
+  enableDynamicToolsForSession(
+    sessionId: string,
+    toolNames: string[]
+  ): boolean {
+    const serverConfig = this.servers.get(sessionId);
+    if (!serverConfig) {
+      console.warn(
+        `Cannot enable dynamic tools - server for session ${sessionId} not found`
+      );
+      return false;
+    }
+
+    // Get or initialize session tool state
+    let state = this.sessionToolState.get(sessionId);
+    if (!state) {
+      state = { enabledDynamicTools: new Set<string>() };
+      this.sessionToolState.set(sessionId, state);
+    }
+
+    let toolsAdded = false;
+
+    // For each tool, check if it's dynamic and not already enabled
+    for (const toolName of toolNames) {
+      const registration = this.registeredTools.get(toolName);
+
+      if (!registration) {
+        console.warn(`Cannot enable unknown tool: ${toolName}`);
+        continue;
+      }
+
+      if (!registration.isDynamic) {
+        console.warn(`Tool ${toolName} is not marked as dynamic`);
+        continue;
+      }
+
+      // Check if already enabled for this session
+      if (state.enabledDynamicTools.has(toolName)) {
+        continue; // Already enabled
+      }
+
+      // Register the tool with this session's server
+      serverConfig.server.tool(
+        registration.name,
+        registration.paramSchema,
+        registration.handler
+      );
+
+      // Track that this tool is now enabled
+      state.enabledDynamicTools.add(toolName);
+      toolsAdded = true;
+
+      console.log(`Enabled dynamic tool ${toolName} for session ${sessionId}`);
+    }
+
+    return toolsAdded;
+  }
+
+  /**
+   * Get or create a server for a session
+   */
+  async getOrCreateServer(sessionId: string): Promise<ServerConfig> {
+    // Check if server exists
+    const existingServer = this.servers.get(sessionId);
+    if (existingServer) {
+      return existingServer;
+    }
+
+    // Create transport with session ID
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => sessionId,
+    });
+
+    // Set up transport close handler to ensure proper cleanup
+    transport.onclose = () => {
+      // Remove the server from our map when transport closes
+      if (transport.sessionId) {
+        this.servers.delete(transport.sessionId);
+        // Also clean up session tool state
+        this.sessionToolState.delete(transport.sessionId);
+        console.log(
+          `Transport closed, removed server for session ${transport.sessionId}`
+        );
+      }
+
+      // Additional cleanup that might be needed
+      this.closeServer(sessionId).catch((error) => {
+        console.error(
+          `Error in additional cleanup during transport close: ${error}`
+        );
+      });
+    };
+
+    // Create a new MCP server instance for this session
+    const server = new McpServer({
+      name: this.serverName,
+      version: this.version,
+    });
+
+    // Apply all registrations to the new server
+    this.applyRegistrationsToServer(server);
+
+    // Connect server to transport
+    await server.connect(transport);
+
+    // Store server and transport
+    const config = { server, transport };
+    this.servers.set(sessionId, config);
+    console.log(`Created server for session ${sessionId}`);
+
+    return config;
+  }
+
+  /**
+   * Apply all registered handlers to a server instance
+   */
+  private applyRegistrationsToServer(server: McpServer): void {
+    // Apply non-dynamic tools
+    for (const {
+      name,
+      paramSchema,
+      handler,
+      isDynamic,
+    } of this.registeredTools.values()) {
+      // Skip dynamic tools, they'll be enabled on demand
+      if (!isDynamic) {
+        server.tool(name, paramSchema, handler);
+      }
+    }
+
+    // Apply string resources
+    for (const {
+      name,
+      uri,
+      handler,
+    } of this.registeredStringResources.values()) {
+      server.resource(name, uri, handler);
+    }
+
+    // Apply template resources
+    for (const {
+      name,
+      template,
+      handler,
+    } of this.registeredTemplateResources.values()) {
+      server.resource(name, template, handler);
+    }
+
+    // Apply prompts
+    for (const {
+      name,
+      paramSchema,
+      handler,
+    } of this.registeredPrompts.values()) {
+      server.prompt(name, paramSchema, handler);
+    }
+  }
+
+  /**
+   * Close and clean up a server
+   */
+  async closeServer(sessionId: string): Promise<void> {
+    const serverConfig = this.servers.get(sessionId);
+    if (serverConfig) {
+      try {
+        // The McpServer class has a close() method that returns a Promise
+        await serverConfig.server.close();
+        console.log(`Closed server for session ${sessionId}`);
+      } catch (error) {
+        console.error(`Error closing server for session ${sessionId}:`, error);
+      } finally {
+        // Always remove from map even if close fails
+        this.servers.delete(sessionId);
+        // Clean up session tool state
+        this.sessionToolState.delete(sessionId);
+      }
+    }
+  }
+
+  /**
+   * Clean up all servers
+   */
+  async closeAllServers(): Promise<void> {
+    const closingPromises: Promise<void>[] = [];
+    for (const sessionId of this.servers.keys()) {
+      closingPromises.push(this.closeServer(sessionId));
+    }
+    await Promise.all(closingPromises);
+  }
+
+  /**
+   * Get a server by session ID
+   */
+  getServer(sessionId: string): ServerConfig | undefined {
+    return this.servers.get(sessionId);
+  }
+}
+
+--- End of src/core/mcp-server-service.ts ---
+
+--- Start of src/core/session-manager.ts ---
+// src/core/session-manager.ts
+import { Request, Response } from "express";
+import { randomUUID } from "crypto";
+import { McpServerService } from "./mcp-server-service";
+import {
+  JsonRpcErrorCode,
+  createJsonRpcError,
+  McpError,
+} from "../shared/errors";
+
+export interface SessionOptions {
+  userId?: string;
+  username?: string;
+  userRole?: string;
+}
+
+export interface Session {
+  id: string;
+  res?: Response;
+  createdAt: Date;
+  userId?: string;
+  username?: string;
+  userRole?: string;
+  lastUpdate?: {
+    stage: string;
+    percent: number;
+    message: string;
+    timestamp: string;
+  };
+}
+
+/**
+ * Simple progress context for tracking operation progress
+ */
+export class ProgressContext {
+  constructor(
+    private sessionId: string,
+    private sessionManager: SessionManager
+  ) {}
+
+  /**
+   * Update progress for the session
+   */
+  update(stage: string, percent: number, message: string): void {
+    this.sessionManager.sendProgress(this.sessionId, stage, percent, message);
+  }
+
+  /**
+   * Mark operation as complete (success or failure)
+   */
+  complete(success: boolean, error?: string): void {
+    this.sessionManager.sendComplete(this.sessionId, success, error);
+  }
+
+  /**
+   * Get the session ID
+   */
+  getSessionId(): string {
+    return this.sessionId;
+  }
+}
+
+/**
+ * Manages MCP sessions and handles requests
+ */
+export class SessionManager {
+  private readonly sessionTimeout = 60 * 60 * 1000; // 1 hour
+  private sessions = new Map<string, Session>();
+
+  // Track which sessions have already had dynamic tools enabled
+  private sessionsWithDynamicTools = new Set<string>();
+
+  // Document-related keywords that will trigger dynamic tools
+  private readonly documentKeywords = [
+    "document",
+    "file",
+    "text",
+    "analyze",
+    "parse",
+    "extract",
+    "content",
+    "read",
+    "summarize",
+    "pdf",
+    "doc",
+    "docx",
+    "txt",
+  ];
+
+  // Document-related dynamic tool IDs
+  private readonly documentToolIds = [
+    "summarizeDocument",
+    "countWordsAndCharacters",
+    "detectDocumentFormat",
+  ];
+
+  constructor(private serverService: McpServerService) {}
+
+  /**
+   * Get or create a session
+   */
+  getOrCreateSession(
+    id: string,
+    res?: Response,
+    options?: SessionOptions
+  ): Session {
+    let session = this.sessions.get(id);
+
+    if (!session) {
+      session = {
+        id,
+        res,
+        createdAt: new Date(),
+        userId: options?.userId,
+        username: options?.username,
+        userRole: options?.userRole,
+      };
+      this.sessions.set(id, session);
+      console.log(
+        `Created session ${id}${
+          options?.username ? ` for user ${options.username}` : ""
+        }`
+      );
+    } else if (res) {
+      // Update response object if provided
+      session.res = res;
+
+      // Update user info if provided
+      if (options?.userId) session.userId = options.userId;
+      if (options?.username) session.username = options.username;
+      if (options?.userRole) session.userRole = options.userRole;
+    }
+
+    return session;
+  }
+
+  /**
+   * Get a session by ID
+   */
+  getSession(id: string): Session | undefined {
+    return this.sessions.get(id);
+  }
+
+  /**
+   * Delete a session
+   */
+  deleteSession(id: string): void {
+    this.sessions.delete(id);
+    this.sessionsWithDynamicTools.delete(id);
+    console.log(`Deleted session ${id}`);
+  }
+
+  /**
+   * Analyze a user message for keywords that might trigger dynamic tools
+   */
+  analyzeMessage(sessionId: string, message: string): void {
+    // Skip analysis if dynamic tools already enabled for this session
+    if (this.sessionsWithDynamicTools.has(sessionId)) {
+      return;
+    }
+
+    // Convert to lowercase for case-insensitive matching
+    const lowercaseMessage = message.toLowerCase();
+
+    // Check for document-related keywords
+    const hasDocumentKeywords = this.documentKeywords.some((keyword) =>
+      lowercaseMessage.includes(keyword)
+    );
+
+    if (hasDocumentKeywords) {
+      console.log(`Detected document-related keywords in session ${sessionId}`);
+
+      // Enable document-related tools for this session
+      const toolsEnabled = this.serverService.enableDynamicToolsForSession(
+        sessionId,
+        this.documentToolIds
+      );
+
+      if (toolsEnabled) {
+        // Mark that we've enabled tools for this session
+        this.sessionsWithDynamicTools.add(sessionId);
+
+        // Notify the user that document tools are now available
+        this.sendNotification(
+          sessionId,
+          "Document analysis tools have been activated based on your query."
+        );
+      }
+    }
+  }
+
+  /**
+   * Send a notification message to the client
+   */
+  sendNotification(id: string, message: string): boolean {
+    const session = this.sessions.get(id);
+    if (!session?.res) {
+      console.warn(
+        `Cannot send notification - session ${id} not found or no response object`
+      );
+      return false;
+    }
+
+    const notification = {
+      type: "notification",
+      message,
+      timestamp: new Date().toISOString(),
+    };
+
+    try {
+      console.log(`[${id}] Notification: ${message}`);
+      session.res.write(`data: ${JSON.stringify(notification)}\n\n`);
+      return true;
+    } catch (error) {
+      console.error(`Error sending notification to session ${id}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Create a progress context for a session
+   */
+  createProgressContext(sessionId: string): ProgressContext {
+    return new ProgressContext(sessionId, this);
+  }
+
+  /**
+   * Send progress update to a session
+   */
+  sendProgress(
+    id: string,
+    stage: string,
+    percent: number,
+    message: string
+  ): boolean {
+    const session = this.sessions.get(id);
+    if (!session?.res) {
+      console.warn(
+        `Cannot send progress update - session ${id} not found or no response object`
+      );
+      return false;
+    }
+
+    const update = {
+      stage,
+      percent,
+      message,
+      timestamp: new Date().toISOString(),
+    };
+
+    session.lastUpdate = update;
+
+    try {
+      console.log(
+        `[${id}] Progress update: ${stage} (${percent}%) - ${message}`
+      );
+      session.res.write(`data: ${JSON.stringify(update)}\n\n`);
+      return true;
+    } catch (error) {
+      console.error(`Error sending progress to session ${id}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Send completion event and close the connection
+   */
+  sendComplete(id: string, success: boolean, error?: string): boolean {
+    const session = this.sessions.get(id);
+    if (!session?.res) {
+      console.warn(
+        `Cannot send completion - session ${id} not found or no response object`
+      );
+      return false;
+    }
+
+    try {
+      const completeEvent = {
+        type: "complete",
+        success,
+        error,
+        timestamp: new Date().toISOString(),
+      };
+
+      console.log(
+        `[${id}] Completion event: ${success ? "Success" : "Failed"} ${
+          error ? "- " + error : ""
+        }`
+      );
+      session.res.write(`data: ${JSON.stringify(completeEvent)}\n\n`);
+      session.res.end();
+      this.deleteSession(id);
+      return true;
+    } catch (error) {
+      console.error(`Error sending completion to session ${id}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Extract text content from MCP request body
+   */
+  extractMessageContent(body: any): string {
+    // Handle different possible message formats in MCP
+    if (!body || typeof body !== "object") {
+      return "";
+    }
+
+    // Check for JSON-RPC format with params
+    if (body.method === "generate" && body.params?.messages) {
+      const messages = body.params.messages;
+      if (Array.isArray(messages) && messages.length > 0) {
+        const lastMessage = messages[messages.length - 1];
+
+        // Handle different message content formats
+        if (typeof lastMessage.content === "string") {
+          return lastMessage.content;
+        } else if (Array.isArray(lastMessage.content)) {
+          // Handle content parts array (multimodal content)
+          return lastMessage.content
+            .filter(
+              (part: any) =>
+                part.type === "text" && typeof part.text === "string"
+            )
+            .map((part: any) => part.text)
+            .join(" ");
+        } else if (lastMessage.content?.type === "text") {
+          return lastMessage.content.text || "";
+        }
+      }
+    }
+
+    // Add more extraction logic for other message formats if needed
+
+    return "";
+  }
+
+  /**
+   * Handle all MCP HTTP requests (unified handler)
+   */
+  async handleRequest(
+    req: Request,
+    res: Response,
+    method: "GET" | "POST" | "DELETE",
+    options?: SessionOptions
+  ): Promise<void> {
+    try {
+      // Get or generate session ID
+      const sessionId =
+        (req.headers["mcp-session-id"] as string) ||
+        (method === "POST" ? randomUUID() : undefined);
+
+      // Validate session ID for non-POST requests
+      if (!sessionId) {
+        this.sendJsonRpcError(
+          res,
+          JsonRpcErrorCode.InvalidRequest,
+          "Missing session ID"
+        );
+        return;
+      }
+
+      // For POST requests, analyze message content for dynamic tool detection
+      if (method === "POST" && req.body) {
+        const messageContent = this.extractMessageContent(req.body);
+        if (messageContent) {
+          this.analyzeMessage(sessionId, messageContent);
+        }
+      }
+
+      // Get or create server
+      const { transport } = await this.serverService.getOrCreateServer(
+        sessionId
+      );
+
+      // Set up SSE for GET requests
+      if (method === "GET") {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+
+        // Store response object for progress updates
+        this.getOrCreateSession(sessionId, res, options);
+      }
+
+      // Handle the request via transport
+      await transport.handleRequest(
+        req,
+        res,
+        method === "POST" ? req.body : undefined
+      );
+
+      // Clean up session for DELETE requests
+      if (method === "DELETE") {
+        this.serverService.closeServer(sessionId);
+      }
+    } catch (error) {
+      this.handleError(res, error);
+    }
+  }
+
+  /**
+   * Handle errors in request processing
+   */
+  private handleError(res: Response, error: unknown): void {
+    console.error("Error handling MCP request:", error);
+
+    if (!res.headersSent) {
+      if (error instanceof McpError) {
+        // Handle MCP-specific errors
+        this.sendJsonRpcError(res, error.code, error.message, error.data);
+      } else {
+        // Handle generic errors
+        this.sendJsonRpcError(
+          res,
+          JsonRpcErrorCode.InternalError,
+          error instanceof Error ? error.message : "Internal server error"
+        );
+      }
+    }
+  }
+
+  /**
+   * Send standard JSON-RPC error response
+   */
+  private sendJsonRpcError(
+    res: Response,
+    code: JsonRpcErrorCode,
+    message: string,
+    data?: any
+  ): void {
+    const errorResponse = createJsonRpcError(code, message, data);
+    const status = this.getHttpStatusForErrorCode(code);
+    res.status(status).json(errorResponse);
+  }
+
+  /**
+   * Convert JSON-RPC error code to HTTP status code
+   */
+  private getHttpStatusForErrorCode(code: JsonRpcErrorCode): number {
+    switch (code) {
+      case JsonRpcErrorCode.ParseError:
+      case JsonRpcErrorCode.InvalidRequest:
+      case JsonRpcErrorCode.InvalidParams:
+        return 400; // Bad Request
+      case JsonRpcErrorCode.MethodNotFound:
+        return 404; // Not Found
+      case JsonRpcErrorCode.AuthenticationRequired:
+        return 401; // Unauthorized
+      case JsonRpcErrorCode.ResourceNotFound:
+      case JsonRpcErrorCode.ToolNotFound:
+      case JsonRpcErrorCode.PromptNotFound:
+        return 404; // Not Found
+      case JsonRpcErrorCode.ServerError:
+      case JsonRpcErrorCode.InternalError:
+      default:
+        return 500; // Internal Server Error
+    }
+  }
+}
+
+--- End of src/core/session-manager.ts ---
+
+--- Start of src/index.ts ---
+// src/index.ts
+import { bootstrap } from "./app";
+import { config } from "./shared/config";
+
+// Start the application
+async function startServer() {
+  try {
+    const { app } = await bootstrap();
+
+    // Start the server
+    const PORT = config.port;
+    app.listen(PORT, () => {
+      console.log(`
+=============================================
+  MCP Express Demo Server
+=============================================
+  Server: ${config.serverName} v${config.serverVersion}
+  Running on: http://localhost:${PORT}
+  MCP Endpoint: http://localhost:${PORT}/mcp (authenticated)
+  Auth Endpoint: http://localhost:${PORT}/auth/login
+  Health Check: http://localhost:${PORT}/health
+=============================================
+  Demo Users:
+  - Username: user1, Password: password1
+  - Username: user2, Password: password2
+=============================================
+      `);
+    });
+  } catch (error) {
+    console.error("Failed to start application:", error);
+    process.exit(1);
+  }
+}
+
+// Handle graceful shutdown
+process.on("SIGINT", () => {
+  console.log("\nShutting down gracefully...");
+  process.exit(0);
+});
+
+// Start the server
+startServer();
+
+--- End of src/index.ts ---
+
+--- Start of src/middleware/auth.ts ---
+// src/middleware/auth.ts
+import { Request, Response, NextFunction } from "express";
+import jwt from "jsonwebtoken";
+import { config } from "../shared/config";
+import { JsonRpcErrorCode, createJsonRpcError } from "../shared/errors";
+
+// Interfaces
+export interface AuthUser {
+  id: string;
+  username: string;
+  // Add any other user properties you need
+}
+
+// Extend Express Request type to include user
+declare global {
+  namespace Express {
+    interface Request {
+      user?: AuthUser;
+    }
+  }
+}
+
+/**
+ * Middleware to authenticate requests using JWT
+ */
+export function authMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  // Get token from header, query, or body
+  const token =
+    req.headers.authorization?.split(" ")[1] || // Bearer TOKEN format
+    (req.query.token as string) ||
+    req.body.token;
+
+  // If no token is provided
+  if (!token) {
+    res
+      .status(401)
+      .json(
+        createJsonRpcError(
+          JsonRpcErrorCode.AuthenticationRequired,
+          "Authentication required"
+        )
+      );
+    return;
+  }
+
+  try {
+    // Verify token
+    const decoded = jwt.verify(token, config.jwt.secret) as AuthUser;
+
+    // Attach user to request
+    req.user = decoded;
+
+    // Continue to next middleware
+    next();
+  } catch (error) {
+    console.error("Auth error:", error);
+    res
+      .status(401)
+      .json(
+        createJsonRpcError(
+          JsonRpcErrorCode.AuthenticationRequired,
+          "Invalid authentication token",
+          { details: error instanceof Error ? error.message : "Unknown error" }
+        )
+      );
+  }
+}
+
+--- End of src/middleware/auth.ts ---
+
+--- Start of src/modules/documents/documents.resources.ts ---
+// src/modules/documents/documents.resources.ts
+import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServerService } from "../../core/mcp-server-service";
+import { DocumentsService } from "./documents.service";
+
+/**
+ * Register document-related resources with the MCP server service
+ */
+export function registerDocumentResources(
+  serverService: McpServerService,
+  documentsService: DocumentsService
+): void {
+  // Register individual document resource
+  serverService.registerResource(
+    "document",
+    new ResourceTemplate("document://{id}", { list: undefined }),
+    async (uri, { id }, context) => {
+      if (!context.sessionId) {
+        return {
+          contents: [],
+          isError: true,
+          errorMessage: "No active session",
+        };
+      }
+
+      if (Array.isArray(id)) {
+        return {
+          contents: [],
+          isError: true,
+          errorMessage: "Invalid document ID format",
+        };
+      }
+
+      const document = await documentsService.getDocument(
+        id as string,
+        context.sessionId
+      );
+
+      // Handle not found or no access
+      if (!document) {
+        return {
+          contents: [],
+          isError: true,
+          errorMessage: "Document not found or access denied",
+        };
+      }
+
+      // Return document with metadata
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            text: document.content,
+            metadata: {
+              title: document.title,
+              lastUpdated: document.updatedAt.toISOString(),
+              tags: document.tags.join(", "),
+              owner: document.ownerId,
+            },
+          },
+        ],
+      };
+    }
+  );
+
+  // Register document listing resource
+  serverService.registerResource(
+    "document-list",
+    new ResourceTemplate("documents://list", { list: undefined }),
+    async (uri, params, context) => {
+      if (!context.sessionId) {
+        return {
+          contents: [],
+          isError: true,
+          errorMessage: "No active session",
+        };
+      }
+
+      const documents = await documentsService.getAccessibleDocuments(
+        context.sessionId
+      );
+
+      // Format documents as a list
+      const documentsList = documents
+        .map(
+          (doc) =>
+            `- ${doc.title} (ID: ${doc.id}, Tags: ${doc.tags.join(", ")})`
+        )
+        .join("\n");
+
+      // Return the formatted list
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            text: documentsList ? documentsList : "No documents found",
+            metadata: {
+              count: documents.length,
+              timestamp: new Date().toISOString(),
+            },
+          },
+        ],
+      };
+    }
+  );
+
+  // Register documents by tag resource
+  serverService.registerResource(
+    "documents-by-tag",
+    new ResourceTemplate("documents://tag/{tag}", { list: undefined }),
+    async (uri, { tag }, context) => {
+      if (!context.sessionId) {
+        return {
+          contents: [],
+          isError: true,
+          errorMessage: "No active session",
+        };
+      }
+
+      if (Array.isArray(tag)) {
+        return {
+          contents: [],
+          isError: true,
+          errorMessage: "Invalid tag format",
+        };
+      }
+
+      const documents = await documentsService.getDocumentsByTag(
+        tag as string,
+        context.sessionId
+      );
+
+      // Format documents as a list
+      const documentsList = documents
+        .map((doc) => `- ${doc.title} (ID: ${doc.id})`)
+        .join("\n");
+
+      // Return the formatted list
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            text: documentsList
+              ? documentsList
+              : `No documents found with tag: ${tag}`,
+            metadata: {
+              tag,
+              count: documents.length,
+              timestamp: new Date().toISOString(),
+            },
+          },
+        ],
+      };
+    }
+  );
+}
+
+--- End of src/modules/documents/documents.resources.ts ---
+
+--- Start of src/modules/documents/documents.service.ts ---
+// src/modules/documents/documents.service.ts
+import { SessionManager } from "../../core/session-manager";
+
+// Document interface
+export interface Document {
+  id: string;
+  title: string;
+  content: string;
+  createdAt: Date;
+  updatedAt: Date;
+  ownerId: string;
+  tags: string[];
+  isPublic: boolean;
+}
+
+// Mock data
+const DOCUMENTS: Document[] = [
+  {
+    id: "doc1",
+    title: "Getting Started Guide",
+    content: "This guide helps you get started with our product...",
+    createdAt: new Date("2023-01-15"),
+    updatedAt: new Date("2023-03-10"),
+    ownerId: "1", // user1
+    tags: ["guide", "onboarding"],
+    isPublic: true,
+  },
+  {
+    id: "doc2",
+    title: "Internal Product Roadmap",
+    content: "Our Q3 plans include launching the following features...",
+    createdAt: new Date("2023-02-20"),
+    updatedAt: new Date("2023-04-05"),
+    ownerId: "1", // user1
+    tags: ["roadmap", "internal"],
+    isPublic: false,
+  },
+  {
+    id: "doc3",
+    title: "API Documentation",
+    content: "The API provides the following endpoints...",
+    createdAt: new Date("2023-01-05"),
+    updatedAt: new Date("2023-04-15"),
+    ownerId: "2", // user2
+    tags: ["api", "documentation"],
+    isPublic: true,
+  },
+];
+
+/**
+ * Service for document management
+ */
+export class DocumentsService {
+  constructor(private sessionManager: SessionManager) {}
+
+  /**
+   * Get a document by ID, respecting access control
+   */
+  async getDocument(
+    documentId: string,
+    sessionId: string
+  ): Promise<Document | null> {
+    // Get user info from session
+    const session = this.sessionManager.getSession(sessionId);
+    const userId = session?.userId;
+
+    // Find the document
+    const document = DOCUMENTS.find((doc) => doc.id === documentId);
+
+    // If document doesn't exist, return null
+    if (!document) {
+      return null;
+    }
+
+    // Check access: public documents are accessible to all,
+    // private documents are only accessible to their owners
+    if (document.isPublic || document.ownerId === userId) {
+      return document;
+    }
+
+    // No access
+    return null;
+  }
+
+  /**
+   * Get all documents accessible to the user
+   */
+  async getAccessibleDocuments(sessionId: string): Promise<Document[]> {
+    // Get user info from session
+    const session = this.sessionManager.getSession(sessionId);
+    const userId = session?.userId;
+
+    // Filter documents: return public ones and ones owned by the user
+    return DOCUMENTS.filter((doc) => doc.isPublic || doc.ownerId === userId);
+  }
+
+  /**
+   * Get documents by tag
+   */
+  async getDocumentsByTag(tag: string, sessionId: string): Promise<Document[]> {
+    const accessibleDocs = await this.getAccessibleDocuments(sessionId);
+    return accessibleDocs.filter((doc) => doc.tags.includes(tag));
+  }
+}
+
+--- End of src/modules/documents/documents.service.ts ---
+
+--- Start of src/modules/documents/documents.tools.ts ---
+// src/modules/documents/documents.tools.ts
+import { z } from "zod";
+import { McpServerService } from "../../core/mcp-server-service";
+import { DocumentsService } from "./documents.service";
+
+/**
+ * Registers document-related tools with the MCP server service.
+ * This function sets up both regular and dynamic tools that can be used to interact with documents.
+ *
+ * @param {McpServerService} serverService - The MCP server service instance to register tools with
+ * @param {DocumentsService} documentsService - The documents service instance for document operations
+ * @returns {void}
+ */
+export function registerDocumentTools(
+  serverService: McpServerService,
+  documentsService: DocumentsService
+): void {
+  /**
+   * Regular tool for searching documents by tag.
+   * This tool is always available and doesn't require dynamic registration.
+   *
+   * @param {Object} params - The parameters object
+   * @param {string} params.tag - The tag to search for in documents
+   * @param {Object} context - The execution context containing session information
+   * @returns {Promise<Object>} A response object containing the search results
+   */
+  serverService.registerTool(
+    "searchDocuments",
+    {
+      tag: z.string().describe("Tag to search for"),
+    },
+    async ({ tag }, context) => {
+      if (!context.sessionId) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: No active session found",
+            },
+          ],
+        };
+      }
+
+      const documents = await documentsService.getDocumentsByTag(
+        tag,
+        context.sessionId
+      );
+
+      if (documents.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No documents found with tag: ${tag}`,
+            },
+          ],
+        };
+      }
+
+      const resultText = documents
+        .map((doc) => `- ${doc.title} (ID: ${doc.id})`)
+        .join("\n");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Found ${documents.length} document(s) with tag "${tag}":\n\n${resultText}`,
+          },
+        ],
+      };
+    }
+  );
+
+  /**
+   * Dynamic tool for document summarization.
+   * This tool is registered dynamically and provides a summary of document content,
+   * including word count, key sentences, and metadata.
+   *
+   * @param {Object} params - The parameters object
+   * @param {string} params.documentId - The ID of the document to summarize
+   * @param {Object} context - The execution context containing session information
+   * @returns {Promise<Object>} A response object containing the document summary
+   */
+  serverService.registerDynamicTool(
+    "summarizeDocument",
+    {
+      documentId: z.string().describe("ID of the document to summarize"),
+    },
+    async ({ documentId }, context) => {
+      if (!context.sessionId) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: No active session found",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const document = await documentsService.getDocument(
+        documentId,
+        context.sessionId
+      );
+
+      if (!document) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Document not found or access denied: ${documentId}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Simple mock summarization for demo purposes
+      const wordCount = document.content.split(/\s+/).length;
+      const sentences = document.content
+        .split(/[.!?]+/)
+        .filter((s) => s.trim());
+      const topSentences = sentences.slice(0, Math.min(3, sentences.length));
+
+      const summary = `
+# Document Summary: ${document.title}
+
+## Overview
+This document contains approximately ${wordCount} words and was last updated on ${document.updatedAt.toLocaleDateString()}.
+
+## Key Points
+${topSentences.map((s) => `- ${s.trim()}`).join("\n")}
+
+## Tags
+${document.tags.join(", ")}
+      `.trim();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: summary,
+          },
+        ],
+      };
+    }
+  );
+
+  /**
+   * Dynamic tool for word and character counting.
+   * This tool analyzes a document and provides detailed statistics about its content,
+   * including character count, word count, sentence count, and paragraph count.
+   *
+   * @param {Object} params - The parameters object
+   * @param {string} params.documentId - The ID of the document to analyze
+   * @param {Object} context - The execution context containing session information
+   * @returns {Promise<Object>} A response object containing the document statistics
+   */
+  serverService.registerDynamicTool(
+    "countWordsAndCharacters",
+    {
+      documentId: z.string().describe("ID of the document to analyze"),
+    },
+    async ({ documentId }, context) => {
+      if (!context.sessionId) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: No active session found",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const document = await documentsService.getDocument(
+        documentId,
+        context.sessionId
+      );
+
+      if (!document) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Document not found or access denied: ${documentId}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Count words and characters
+      const text = document.content;
+      const charCount = text.length;
+      const wordCount = text
+        .split(/\s+/)
+        .filter((word) => word.length > 0).length;
+      const sentenceCount = text.split(/[.!?]+/).filter((s) => s.trim()).length;
+      const paragraphCount = text
+        .split(/\n\s*\n/)
+        .filter((p) => p.trim()).length;
+
+      const analysis = `
+# Document Statistics: ${document.title}
+
+- Character count: ${charCount}
+- Word count: ${wordCount}
+- Sentence count: ${sentenceCount}
+- Paragraph count: ${paragraphCount}
+- Average words per sentence: ${(
+        wordCount / Math.max(1, sentenceCount)
+      ).toFixed(1)}
+      `.trim();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: analysis,
+          },
+        ],
+      };
+    }
+  );
+
+  /**
+   * Dynamic tool for document format detection.
+   * This tool analyzes a document's content to determine its likely format
+   * (e.g., Markdown, HTML, JSON, source code) based on content patterns.
+   *
+   * @param {Object} params - The parameters object
+   * @param {string} params.documentId - The ID of the document to analyze
+   * @param {Object} context - The execution context containing session information
+   * @returns {Promise<Object>} A response object containing the format analysis
+   *
+   * @description
+   * The tool performs the following format detection:
+   * - Checks for Markdown syntax (headings, links, lists)
+   * - Detects HTML tags
+   * - Identifies JSON structure
+   * - Looks for programming language keywords
+   *
+   * The confidence level is determined based on the number and strength of indicators found.
+   */
+  serverService.registerDynamicTool(
+    "detectDocumentFormat",
+    {
+      documentId: z.string().describe("ID of the document to analyze"),
+    },
+    async ({ documentId }, context) => {
+      if (!context.sessionId) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: No active session found",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const document = await documentsService.getDocument(
+        documentId,
+        context.sessionId
+      );
+
+      if (!document) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Document not found or access denied: ${documentId}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Simple format detection (mock for demo purposes)
+      const content = document.content;
+
+      // Detect if it's likely Markdown
+      const hasMarkdownHeadings = /^#+\s+.+$/m.test(content);
+      const hasMarkdownLinks = /\[.+\]\(.+\)/.test(content);
+      const hasMarkdownLists = /^[-*+]\s+.+$/m.test(content);
+
+      // Detect if it's likely HTML
+      const hasHtmlTags = /<\/?[a-z][\s\S]*>/i.test(content);
+
+      // Detect if it's likely JSON
+      const isLikelyJson =
+        /^\s*[{\[]/.test(content) && /[}\]]\s*$/.test(content);
+
+      // Detect if it's likely code
+      const hasCodeElements =
+        /(function|class|import|export|const|let|var|if|for|while)\s/.test(
+          content
+        );
+
+      // Make a determination
+      let format = "Plain text";
+      let confidence = "Low";
+
+      if (hasHtmlTags) {
+        format = "HTML";
+        confidence = hasHtmlTags ? "High" : "Medium";
+      } else if (isLikelyJson) {
+        format = "JSON";
+        confidence = "High";
+      } else if (hasMarkdownHeadings || hasMarkdownLinks || hasMarkdownLists) {
+        format = "Markdown";
+        confidence =
+          hasMarkdownHeadings && hasMarkdownLinks ? "High" : "Medium";
+      } else if (hasCodeElements) {
+        format = "Source code";
+        confidence = "Medium";
+      }
+
+      const analysis = `
+# Document Format Analysis: ${document.title}
+
+- Detected format: ${format}
+- Confidence: ${confidence}
+
+## Format indicators detected:
+${hasHtmlTags ? "- HTML tags\n" : ""}${
+        isLikelyJson ? "- JSON structure\n" : ""
+      }${hasMarkdownHeadings ? "- Markdown headings\n" : ""}${
+        hasMarkdownLinks ? "- Markdown links\n" : ""
+      }${hasMarkdownLists ? "- Markdown lists\n" : ""}${
+        hasCodeElements ? "- Programming language keywords\n" : ""
+      }
+      `.trim();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: analysis,
+          },
+        ],
+      };
+    }
+  );
+}
+
+--- End of src/modules/documents/documents.tools.ts ---
+
+--- Start of src/modules/index.ts ---
+// src/modules/index.ts
+import { McpServerService } from "../core/mcp-server-service";
+import { SessionManager } from "../core/session-manager";
+
+// User module
+import { UserService } from "./user/user.service";
+import { registerUserTools } from "./user/user.tools";
+
+// Documents module
+import { DocumentsService } from "./documents/documents.service";
+import { registerDocumentResources } from "./documents/documents.resources";
+import { registerDocumentTools } from "./documents/documents.tools";
+
+// Prompts module
+import { PromptsService } from "./prompts/prompts.service";
+import { registerPromptTemplates } from "./prompts/prompt-templates";
+import { registerPromptTools } from "./prompts/prompts.tools";
+
+/**
+ * Register all modules with the MCP server
+ */
+export function registerAllModules(
+  serverService: McpServerService,
+  sessionManager: SessionManager
+) {
+  // Create module services
+  const userService = new UserService(sessionManager);
+  const documentsService = new DocumentsService(sessionManager);
+  const promptsService = new PromptsService(sessionManager);
+
+  // Register module components with the serverService
+  registerUserTools(serverService, userService);
+  registerDocumentResources(serverService, documentsService);
+  registerDocumentTools(serverService, documentsService);
+  registerPromptTemplates(serverService, promptsService);
+  registerPromptTools(serverService, promptsService);
+
+  console.log("All modules registered");
+
+  // Return all services for potential cross-module usage
+  return {
+    userService,
+    documentsService,
+    promptsService,
+  };
+}
+
+--- End of src/modules/index.ts ---
+
+--- Start of src/modules/prompts/prompt-templates.ts ---
+// src/modules/prompts/prompt-templates.ts
+import { z } from "zod";
+import { McpServerService } from "../../core/mcp-server-service";
+import { PromptsService } from "./prompts.service";
+
+/**
+ * Register prompt templates with the MCP server service
+ */
+export function registerPromptTemplates(
+  serverService: McpServerService,
+  promptsService: PromptsService
+): void {
+  // Document summary prompt
+  serverService.registerPrompt(
+    "document-summary",
+    {
+      content: z.string().describe("The document content to summarize"),
+    },
+    ({ content }) => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: `Please provide a concise summary of the following document:\n\n${content}`,
+          },
+        },
+      ],
+    })
+  );
+
+  // API usage example prompt
+  serverService.registerPrompt(
+    "api-usage-example",
+    {
+      language: z.string().describe("Programming language for the example"),
+      endpoint: z.string().describe("API endpoint name"),
+      parameters: z.string().describe("Parameters to include in the example"),
+    },
+    ({ language, endpoint, parameters }) => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: `Generate a code example in ${language} showing how to use the ${endpoint} API endpoint with the following parameters: ${parameters}`,
+          },
+        },
+      ],
+    })
+  );
+}
+
+--- End of src/modules/prompts/prompt-templates.ts ---
+
+--- Start of src/modules/prompts/prompts.service.ts ---
+// src/modules/prompts/prompts.service.ts
+import { SessionManager } from "../../core/session-manager";
+
+export interface PromptTemplate {
+  id: string;
+  title: string;
+  description: string;
+  template: string;
+}
+
+/**
+ * Service for prompt management
+ */
+export class PromptsService {
+  // Sample prompt templates
+  private promptTemplates: PromptTemplate[] = [
+    {
+      id: "document-summary",
+      title: "Document Summary",
+      description: "Create a concise summary of a document",
+      template:
+        "Please provide a concise summary of the following document: {{content}}",
+    },
+    {
+      id: "api-usage",
+      title: "API Usage Example",
+      description: "Generate example code for using an API endpoint",
+      template:
+        "Generate a code example in {{language}} showing how to use the {{endpoint}} API endpoint with the following parameters: {{parameters}}",
+    },
+  ];
+
+  constructor(private sessionManager: SessionManager) {}
+
+  /**
+   * Get all available prompt templates
+   */
+  getPromptTemplates(sessionId: string): PromptTemplate[] {
+    // In a real implementation, you might filter based on user permissions
+    const session = this.sessionManager.getSession(sessionId);
+
+    // For this demo, we'll return all templates regardless of user
+    return this.promptTemplates;
+  }
+
+  /**
+   * Get a specific prompt template by ID
+   */
+  getPromptTemplate(
+    templateId: string,
+    sessionId: string
+  ): PromptTemplate | null {
+    // In a real implementation, you might check user permissions
+    return (
+      this.promptTemplates.find((template) => template.id === templateId) ||
+      null
+    );
+  }
+}
+
+--- End of src/modules/prompts/prompts.service.ts ---
+
+--- Start of src/modules/prompts/prompts.tools.ts ---
+// src/modules/prompts/prompts.tools.ts
+import { McpServerService } from "../../core/mcp-server-service";
+import { PromptsService } from "./prompts.service";
+
+/**
+ * Register prompt-related tools with the MCP server service
+ */
+export function registerPromptTools(
+  serverService: McpServerService,
+  promptsService: PromptsService
+): void {
+  // List available prompts
+  serverService.registerTool("listPrompts", {}, async (params, context) => {
+    if (!context.sessionId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: No active session found",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const templates = promptsService.getPromptTemplates(context.sessionId);
+
+    if (templates.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No prompt templates available",
+          },
+        ],
+      };
+    }
+
+    const promptsList = templates
+      .map(
+        (template) =>
+          `- ${template.title} (ID: ${template.id}): ${template.description}`
+      )
+      .join("\n");
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Available prompt templates:\n\n${promptsList}`,
+        },
+      ],
+    };
+  });
+}
+
+--- End of src/modules/prompts/prompts.tools.ts ---
+
+--- Start of src/modules/user/user.service.ts ---
+// src/modules/user/user.service.ts
+import { SessionManager } from "../../core/session-manager";
+
+/**
+ * Service for user-related functionality
+ */
+export class UserService {
+  constructor(private sessionManager: SessionManager) {}
+
+  /**
+   * Get information about the current user
+   */
+  getUserInfo(sessionId: string): { id?: string; username?: string } | null {
+    const session = this.sessionManager.getSession(sessionId);
+
+    if (!session?.userId) {
+      return null;
+    }
+
+    return {
+      id: session.userId,
+      username: session.username,
+    };
+  }
+}
+
+--- End of src/modules/user/user.service.ts ---
+
+--- Start of src/modules/user/user.tools.ts ---
+// src/modules/user/user.tools.ts
+import { McpServerService } from "../../core/mcp-server-service";
+import { UserService } from "./user.service";
+
+/**
+ * Register user-related tools with the MCP server service
+ */
+export function registerUserTools(
+  serverService: McpServerService,
+  userService: UserService
+): void {
+  // Register user info tool
+  serverService.registerTool("userInfo", {}, async (params, context) => {
+    if (!context.sessionId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: No active session found",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const userInfo = userService.getUserInfo(context.sessionId);
+
+    if (!userInfo) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: Not authenticated",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `You are logged in as: ${userInfo.username} (ID: ${userInfo.id})`,
+        },
+      ],
+    };
+  });
+}
+
+--- End of src/modules/user/user.tools.ts ---
+
+--- Start of src/routes/auth.ts ---
+// src/routes/auth.ts
+import {
+  Router,
+  Request,
+  Response,
+  Application,
+  RequestHandler,
+} from "express";
+import jwt, { SignOptions } from "jsonwebtoken";
+import { AuthUser } from "../middleware/auth";
+import { config } from "../shared/config";
+import { authMiddleware } from "../middleware/auth";
+
+// In a real app, you'd use a database
+const DEMO_USERS = [
+  { id: "1", username: "user1", password: "password1" },
+  { id: "2", username: "user2", password: "password2" },
+];
+
+/**
+ * Create and configure auth router
+ */
+export function setupAuthRoutes(app: Application): void {
+  const authRouter = Router();
+
+  // Login route
+  authRouter.post("/login", ((req: Request, res: Response) => {
+    const { username, password } = req.body;
+
+    // Simple validation
+    if (!username || !password) {
+      return res.status(400).json({
+        error: "Username and password are required",
+      });
+    }
+
+    // Find user (in a real app, you'd query a database)
+    const user = DEMO_USERS.find(
+      (u) => u.username === username && u.password === password
+    );
+
+    if (!user) {
+      return res.status(401).json({
+        error: "Invalid credentials",
+      });
+    }
+
+    // Create JWT payload (exclude password)
+    const userForToken: AuthUser = {
+      id: user.id,
+      username: user.username,
+    };
+
+    // Generate token
+    const token = jwt.sign(
+      userForToken,
+      config.jwt.secret as jwt.Secret,
+      {
+        expiresIn: config.jwt.expiresIn,
+      } as SignOptions
+    );
+
+    // Send response
+    res.json({
+      user: userForToken,
+      token,
+      expiresIn: config.jwt.expiresIn,
+    });
+  }) as RequestHandler);
+
+  // Get current user info
+  authRouter.get("/me", authMiddleware, (req: Request, res: Response) => {
+    // The authMiddleware will already have handled token validation
+    // and attached the user to the request
+    res.json({ user: req.user });
+  });
+
+  // Mount the router
+  app.use("/auth", authRouter);
+}
+
+--- End of src/routes/auth.ts ---
+
+--- Start of src/shared/config.ts ---
+// src/shared/config.ts
+import dotenv from "dotenv";
+
+// Load environment variables
+dotenv.config();
+
+export const config = {
+  port: process.env.PORT ? parseInt(process.env.PORT, 10) : 3000,
+  serverName: process.env.SERVER_NAME || "MCP Express Demo",
+  serverVersion: process.env.SERVER_VERSION || "1.0.0",
+  jwt: {
+    secret: process.env.JWT_SECRET || "development-secret-key",
+    expiresIn: "24h",
+  },
+};
+
+--- End of src/shared/config.ts ---
+
+--- Start of src/shared/errors.ts ---
+// src/shared/errors.ts
+/**
+ * Standard JSON-RPC error codes as defined in the specification
+ */
+export enum JsonRpcErrorCode {
+  // Standard JSON-RPC error codes
+  ParseError = -32700,
+  InvalidRequest = -32600,
+  MethodNotFound = -32601,
+  InvalidParams = -32602,
+  InternalError = -32603,
+  // Server error codes (reserved from -32000 to -32099)
+  ServerError = -32000,
+  // MCP specific error codes
+  AuthenticationRequired = -32001,
+  ResourceNotFound = -32002,
+  ToolNotFound = -32003,
+  PromptNotFound = -32004,
+}
+
+/**
+ * JSON-RPC error response
+ */
+export interface JsonRpcError {
+  code: number;
+  message: string;
+  data?: any;
+}
+
+/**
+ * JSON-RPC error response wrapper
+ */
+export interface JsonRpcErrorResponse {
+  jsonrpc: "2.0";
+  error: JsonRpcError;
+  id: string | number | null;
+}
+
+/**
+ * Create a standard JSON-RPC error response
+ */
+export function createJsonRpcError(
+  code: JsonRpcErrorCode,
+  message: string,
+  data?: any,
+  id: string | number | null = null
+): JsonRpcErrorResponse {
+  return {
+    jsonrpc: "2.0",
+    error: {
+      code,
+      message,
+      ...(data ? { data } : {}),
+    },
+    id,
+  };
+}
+
+/**
+ * Helper class for MCP error handling
+ */
+export class McpError extends Error {
+  code: JsonRpcErrorCode;
+  data?: any;
+
+  constructor(code: JsonRpcErrorCode, message: string, data?: any) {
+    super(message);
+    this.name = "McpError";
+    this.code = code;
+    this.data = data;
+  }
+
+  /**
+   * Convert to JSON-RPC error response
+   */
+  toJsonRpcError(id: string | number | null = null): JsonRpcErrorResponse {
+    return createJsonRpcError(this.code, this.message, this.data, id);
+  }
+}
+
+--- End of src/shared/errors.ts ---
+
+--- Start of tsconfig.json ---
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    "outDir": "./dist",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}
+--- End of tsconfig.json ---
+
