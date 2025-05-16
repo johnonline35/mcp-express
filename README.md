@@ -66,24 +66,105 @@ The implementation supports:
 
 The application is built around a modular architecture, where each domain (user, documents, prompts, etc.) is encapsulated in its own module. This makes the system extensible, maintainable, and easy to understand.
 
-### Module Registration
+### App Bootstrap (src/app.ts)
 
-All modules are registered in `src/modules/index.ts` via the `registerAllModules` function. This function is called during app bootstrap and wires up each module's tools, resources, and prompts with the core MCP server.
+The main entry point for the application is the `bootstrap` function, which sets up the Express app, core services, registers all modules, and configures routes:
 
-**Example:**
 ```typescript
-export function registerAllModules(serverService, sessionManager) {
+// src/app.ts
+import express from "express";
+import cors from "cors";
+import { McpServerService } from "./core/mcp-server-service";
+import { SessionManager } from "./core/session-manager";
+import { setupMcpRoutes } from "./core/http-controller";
+import { setupAuthRoutes } from "./routes/auth";
+import { registerAllModules } from "./modules/index";
+import { config } from "./shared/config";
+
+/**
+ * Bootstrap the application
+ */
+export async function bootstrap() {
+  // Create Express app
+  const app = express();
+
+  // Configure middleware
+  app.use(express.json({ limit: "50mb" }));
+  app.use(cors());
+
+  // Create core services
+  const serverService = new McpServerService("Test MCP Server", "1.0.0");
+  const sessionManager = new SessionManager(serverService);
+
+  // Register all modules
+  registerAllModules(serverService, sessionManager);
+
+  // Set up auth routes
+  setupAuthRoutes(app);
+
+  // Set up MCP routes
+  setupMcpRoutes(app, sessionManager);
+
+  // Start server
+  const PORT = config.port || 3000;
+  app.listen(PORT, () => {
+    console.log(`MCP Server running on port ${PORT}`);
+  });
+
+  return { app, serverService, sessionManager };
+}
+```
+
+### Module Registration (src/modules/index.ts)
+
+All modules are registered in `src/modules/index.ts` via the `registerAllModules` function. This function wires up each module's tools, resources, and prompts with the core MCP server:
+
+```typescript
+// src/modules/index.ts
+import { McpServerService } from "../core/mcp-server-service";
+import { SessionManager } from "../core/session-manager";
+
+// User module
+import { UserService } from "./user/user.service";
+import { registerUserTools } from "./user/user.tools";
+
+// Documents module
+import { DocumentsService } from "./documents/documents.service";
+import { registerDocumentResources } from "./documents/documents.resources";
+import { registerDocumentTools } from "./documents/documents.tools";
+
+// Prompts module
+import { PromptsService } from "./prompts/prompts.service";
+import { registerPromptTemplates } from "./prompts/prompt-templates";
+import { registerPromptTools } from "./prompts/prompts.tools";
+
+/**
+ * Register all modules with the MCP server
+ */
+export function registerAllModules(
+  serverService: McpServerService,
+  sessionManager: SessionManager
+) {
   // Create module services
   const userService = new UserService(sessionManager);
   const documentsService = new DocumentsService(sessionManager);
   const promptsService = new PromptsService(sessionManager);
 
-  // Register module components
+  // Register module components with the serverService
   registerUserTools(serverService, userService);
   registerDocumentResources(serverService, documentsService);
   registerDocumentTools(serverService, documentsService);
   registerPromptTemplates(serverService, promptsService);
   registerPromptTools(serverService, promptsService);
+
+  console.log("All modules registered");
+
+  // Return all services for potential cross-module usage
+  return {
+    userService,
+    documentsService,
+    promptsService,
+  };
 }
 ```
 
